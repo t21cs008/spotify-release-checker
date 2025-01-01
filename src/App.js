@@ -1,12 +1,14 @@
+// src/App.js
 import React, { useState, useEffect } from 'react';
 import dayjs from 'dayjs';
+import { auth, database } from './firebase';
+import { useAuthState } from 'react-firebase-hooks/auth';
+import Login from './Login';
+import './App.css';
 
 // ▼ SpotifyのClient ID / Secret をあなたのアプリのものに置き換えてください
 const CLIENT_ID = "c735f0cbc16143288401c000b19d6cc8";
 const CLIENT_SECRET = "bfdf0e1ce50e45749e7b416de2d009da";
-
-// ローカルストレージのキー
-const STORAGE_KEY = 'spotify_releases';
 
 // プレフィックスの配列（A-Z）
 const PREFIXES = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
@@ -16,22 +18,40 @@ function App() {
   const [releases, setReleases] = useState({});
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [fetchedPrefixes, setFetchedPrefixes] = useState({}); // { '2025-01-01': ['A', 'B', ...], ... }
+  const [user] = useAuthState(auth);
+  const [likes, setLikes] = useState([]);
+  const [sortOption, setSortOption] = useState('name-asc'); // デフォルトの並び替えオプション
 
-  // ローカルストレージからデータを読み込む
+  // Realtime Databaseのユーザーデータ参照
+  const userReleasesRef = user ? database.ref(`users/${user.uid}/releases`) : null;
+  const userLikesRef = user ? database.ref(`users/${user.uid}/likes`) : null;
+
+  // Realtime Databaseからデータを読み込む
   useEffect(() => {
-    const storedData = localStorage.getItem(STORAGE_KEY);
-    if (storedData) {
-      const parsedData = JSON.parse(storedData);
-      setReleases(parsedData.releases || {});
-      setFetchedPrefixes(parsedData.fetchedPrefixes || {});
+    if (user) {
+      // リリースデータの取得
+      userReleasesRef.on('value', (snapshot) => {
+        const data = snapshot.val() || {};
+        setReleases(data);
+      });
+
+      // ライクデータの取得
+      userLikesRef.on('value', (snapshot) => {
+        const data = snapshot.val() || {};
+        const likedItems = Object.values(data);
+        setLikes(likedItems);
+      });
+    } else {
+      setReleases({});
+      setLikes([]);
     }
-  }, []);
 
-  // データをローカルストレージに保存する
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ releases, fetchedPrefixes }));
-  }, [releases, fetchedPrefixes]);
+    // クリーンアップ
+    return () => {
+      if (userReleasesRef) userReleasesRef.off();
+      if (userLikesRef) userLikesRef.off();
+    };
+  }, [user, userReleasesRef, userLikesRef]);
 
   // アクセストークンを取得する関数
   const getAccessToken = async () => {
@@ -98,41 +118,41 @@ function App() {
 
   // 指定日のリリースを取得
   const fetchReleasesByDate = async (selectedDate) => {
+    if (!user) {
+      setError("ログインしてください。");
+      return;
+    }
+
     setLoading(true);
     setError("");
 
     const selectedDay = dayjs(selectedDate).format('YYYY-MM-DD');
     const selectedYear = dayjs(selectedDate).format('YYYY');
 
-    // 既にその日のプレフィックスを取得済みか確認
-    const prefixesFetchedForDate = fetchedPrefixes[selectedDay] || [];
-    const prefixesToFetch = PREFIXES.filter(prefix => !prefixesFetchedForDate.includes(prefix));
-
-    if (prefixesToFetch.length === 0) {
-      // 既に全てのプレフィックスが取得済みなので、データを表示する
-      filterAndSetReleases(selectedDay);
-      setLoading(false);
-      return;
-    }
-
-    const accessToken = await getAccessToken();
-    if (!accessToken) {
-      setLoading(false);
-      return;
-    }
-
     try {
-      let allFetchedItems = releases[selectedDay] ? [...releases[selectedDay].albums, ...releases[selectedDay].singles] : [];
+      // Realtime Databaseでキャッシュを確認
+      const snapshot = await userReleasesRef.child(selectedDay).once('value');
+      if (snapshot.exists()) {
+        setReleases(prev => ({
+          ...prev,
+          [selectedDay]: snapshot.val()
+        }));
+        setLoading(false);
+        return;
+      }
+
+      const accessToken = await getAccessToken();
+      if (!accessToken) {
+        setLoading(false);
+        return;
+      }
+
+      let allFetchedItems = [];
 
       // プレフィックスごとに検索
-      for (const prefix of prefixesToFetch) {
+      for (const prefix of PREFIXES) {
         const items = await fetchReleasesByPrefix(prefix, selectedYear, accessToken);
         allFetchedItems = allFetchedItems.concat(items);
-        // フェッチ済みのプレフィックスに追加
-        setFetchedPrefixes(prev => ({
-          ...prev,
-          [selectedDay]: prev[selectedDay] ? [...prev[selectedDay], prefix] : [prefix]
-        }));
       }
 
       // フィルタリング
@@ -143,22 +163,27 @@ function App() {
 
       if (filtered.length === 0) {
         setError(`指定日 (${selectedDay}) に対応するリリースは見つかりませんでした。`);
+        setLoading(false);
+        return;
       }
 
       // 日付ごとに分類
-      const releasesByDate = { ...releases };
-      if (!releasesByDate[selectedDay]) {
-        releasesByDate[selectedDay] = { albums: [], singles: [] };
-      }
+      const releasesByDate = { albums: [], singles: [] };
       filtered.forEach(item => {
         if (item.album_type === 'album') {
-          releasesByDate[selectedDay].albums.push(item);
+          releasesByDate.albums.push(item);
         } else if (item.album_type === 'single') {
-          releasesByDate[selectedDay].singles.push(item);
+          releasesByDate.singles.push(item);
         }
       });
 
-      setReleases(releasesByDate);
+      // Realtime Databaseに保存
+      await userReleasesRef.child(selectedDay).set(releasesByDate);
+
+      setReleases(prev => ({
+        ...prev,
+        [selectedDay]: releasesByDate
+      }));
 
     } catch (err) {
       console.error(err);
@@ -168,22 +193,29 @@ function App() {
     }
   };
 
-  // 指定日のリリースをフィルターしてセット
-  const filterAndSetReleases = (selectedDay) => {
-    const filtered = [];
-    if (releases[selectedDay]) {
-      filtered.push(...releases[selectedDay].albums, ...releases[selectedDay].singles);
+  // ライク機能の実装
+  const toggleLike = async (item) => {
+    if (!user) {
+      setError("ログインしてください。");
+      return;
     }
 
-    if (filtered.length === 0) {
-      setError(`指定日 (${selectedDay}) に対応するリリースは見つかりませんでした。`);
+    try {
+      const likeRef = userLikesRef.child(item.id);
+      const snapshot = await likeRef.once('value');
+      if (snapshot.exists()) {
+        // 既にライクしている場合、ライクを解除
+        await likeRef.remove();
+        setLikes(prev => prev.filter(liked => liked.id !== item.id));
+      } else {
+        // ライクしていない場合、ライクを追加
+        await likeRef.set(item);
+        setLikes(prev => [...prev, item]);
+      }
+    } catch (err) {
+      console.error("ライクのトグル中にエラーが発生しました:", err);
+      setError("ライクの更新に失敗しました。");
     }
-
-    // 日付ごとに分類（既に分類済みなので再分類は不要）
-    // そのまま releases を表示する
-
-    // Force re-render by setting releases state
-    setReleases({ ...releases });
   };
 
   // 検索ボタン押下
@@ -198,15 +230,20 @@ function App() {
 
   // アプリ起動時に今日のリリースを自動で取得
   useEffect(() => {
-    const today = dayjs().format('YYYY-MM-DD');
-    if (!releases[today]) {
+    if (user) {
+      const today = dayjs().format('YYYY-MM-DD');
       fetchReleasesByDate(today);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [user]);
 
   // HTMLとして保存する関数
   const saveAsHTML = () => {
+    if (!user) {
+      setError("ログインしてください。");
+      return;
+    }
+
     const today = dayjs().format('YYYY-MM-DD');
     const data = releases[today];
     if (!data) {
@@ -266,6 +303,7 @@ function App() {
         <h3>${item.name}</h3>
         <p>アーティスト: ${item.artists && item.artists[0] ? item.artists[0].name : '不明'}</p>
         <p>リリース日: ${item.release_date}</p>
+        <p><a href="${item.external_urls.spotify}" target="_blank">Spotifyで見る</a></p>
       </div>
     `).join('')}
   </div>
@@ -278,6 +316,7 @@ function App() {
         <h3>${item.name}</h3>
         <p>アーティスト: ${item.artists && item.artists[0] ? item.artists[0].name : '不明'}</p>
         <p>リリース日: ${item.release_date}</p>
+        <p><a href="${item.external_urls.spotify}" target="_blank">Spotifyで見る</a></p>
       </div>
     `).join('')}
   </div>
@@ -295,64 +334,130 @@ function App() {
     document.body.removeChild(link);
   };
 
+  // 並び替えオプションの変更
+  const handleSortChange = (e) => {
+    setSortOption(e.target.value);
+  };
+
+  // 並び替えを適用したリリースデータを取得
+  const getSortedReleases = () => {
+    const sortedReleases = { ...releases };
+    Object.keys(sortedReleases).forEach(date => {
+      const { albums, singles } = sortedReleases[date];
+      
+      // 並び替えロジック
+      const sortFunctions = {
+        'name-asc': (a, b) => a.name.localeCompare(b.name),
+        'name-desc': (a, b) => b.name.localeCompare(a.name),
+        'genre-asc': (a, b) => {
+          const genreA = a.genres ? a.genres[0] : 'Unknown';
+          const genreB = b.genres ? b.genres[0] : 'Unknown';
+          return genreA.localeCompare(genreB);
+        },
+        'genre-desc': (a, b) => {
+          const genreA = a.genres ? a.genres[0] : 'Unknown';
+          const genreB = b.genres ? b.genres[0] : 'Unknown';
+          return genreB.localeCompare(genreA);
+        },
+      };
+
+      const sortFunc = sortFunctions[sortOption] || sortFunctions['name-asc'];
+
+      sortedReleases[date].albums.sort(sortFunc);
+      sortedReleases[date].singles.sort(sortFunc);
+    });
+
+    return sortedReleases;
+  };
+
   return (
-    <div style={{ margin: '20px' }}>
+    <div style={styles.container}>
       <h1>Spotifyリリースチェッカー</h1>
       <p>指定した日付のリリース作品を取得します。（アルバム／シングルを区別）</p>
-      <form onSubmit={handleSearch}>
+
+      {/* 認証部分 */}
+      <div style={styles.authSection}>
+        {user ? (
+          <div style={styles.userInfo}>
+            <p>ログイン中: {user.email}</p>
+            <button onClick={() => auth.signOut()} style={styles.logoutButton}>ログアウト</button>
+          </div>
+        ) : (
+          <Login />
+        )}
+      </div>
+
+      {/* 検索フォーム */}
+      <form onSubmit={handleSearch} style={styles.searchForm}>
         <label>
           日付を選択:{" "}
           <input
             type="date"
             value={dateInput}
             onChange={(e) => setDateInput(e.target.value)}
-            style={{ marginRight: '10px' }}
-            min="2025-01-01" // 最小日付を2025年1月1日に設定
+            style={styles.dateInput}
+            max={dayjs().format('YYYY-MM-DD')} // 最大日付を今日に設定
           />
         </label>
-        <button type="submit">検索</button>
-        <button type="button" onClick={saveAsHTML} style={{ marginLeft: '10px' }}>
+        <button type="submit" style={styles.searchButton}>検索</button>
+        <button type="button" onClick={saveAsHTML} style={styles.saveButton}>
           HTMLとして保存
         </button>
       </form>
 
-      {loading && <p>検索中です…</p>}
-      {error && <p style={{ color: 'red' }}>{error}</p>}
+      {/* 並び替えオプション */}
+      <div style={styles.sortSection}>
+        <label>並び替え: </label>
+        <select value={sortOption} onChange={handleSortChange} style={styles.sortSelect}>
+          <option value="name-asc">名前の昇順</option>
+          <option value="name-desc">名前の降順</option>
+          <option value="genre-asc">ジャンルの昇順</option>
+          <option value="genre-desc">ジャンルの降順</option>
+        </select>
+      </div>
 
+      {loading && <p>検索中です…</p>}
+      {error && <p style={styles.error}>{error}</p>}
+
+      {/* リリース情報の表示 */}
       {Object.keys(releases).length > 0 && (
-        Object.keys(releases).sort().map(date => (
-          <div key={date} style={{ marginTop: '20px' }}>
+        Object.keys(getSortedReleases()).sort().map(date => (
+          <div key={date} style={styles.releaseSection}>
             <h2>{date}</h2>
             <div>
               <h3>【アルバム】</h3>
               {releases[date].albums.length > 0 ? (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '20px' }}>
+                <div style={styles.grid}>
                   {releases[date].albums.map(item => (
                     <div
                       key={item.id}
-                      style={{
-                        border: '1px solid #ccc',
-                        borderRadius: '8px',
-                        padding: '10px',
-                        width: '200px',
-                        boxShadow: '2px 2px 12px rgba(0,0,0,0.1)',
-                        textAlign: 'center'
-                      }}
+                      style={styles.card}
                     >
                       <img
                         src={item.images && item.images[0] ? item.images[0].url : ''}
                         alt={item.name}
-                        style={{ width: '100%', height: 'auto', borderRadius: '4px' }}
+                        style={styles.image}
                       />
-                      <h3 style={{ margin: '10px 0 5px 0' }}>{item.name}</h3>
+                      <h3 style={styles.cardTitle}>{item.name}</h3>
                       {item.artists && item.artists[0] && (
-                        <p style={{ margin: '5px 0', fontSize: '14px' }}>アーティスト: {item.artists[0].name}</p>
+                        <p style={styles.cardText}>アーティスト: {item.artists[0].name}</p>
                       )}
-                      <p style={{ margin: '5px 0', fontSize: '12px' }}>
+                      <p style={styles.cardText}>
                         リリース日: {item.release_date}
                       </p>
-                      <p style={{ margin: '5px 0', fontSize: '12px' }}>
-                        album_type: {item.album_type}
+                      <button
+                        onClick={() => toggleLike(item)}
+                        style={{
+                          ...styles.likeButton,
+                          color: likes.find(liked => liked.id === item.id) ? 'red' : 'grey'
+                        }}
+                      >
+                        ♥
+                      </button>
+                      <p style={styles.cardLink}>
+                        <a href={item.external_urls.spotify} target="_blank" rel="noopener noreferrer">
+                          Spotifyで見る
+                        </a>
                       </p>
                     </div>
                   ))}
@@ -362,33 +467,37 @@ function App() {
             <div>
               <h3>【シングル】</h3>
               {releases[date].singles.length > 0 ? (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '20px' }}>
+                <div style={styles.grid}>
                   {releases[date].singles.map(item => (
                     <div
                       key={item.id}
-                      style={{
-                        border: '1px solid #ccc',
-                        borderRadius: '8px',
-                        padding: '10px',
-                        width: '200px',
-                        boxShadow: '2px 2px 12px rgba(0,0,0,0.1)',
-                        textAlign: 'center'
-                      }}
+                      style={styles.card}
                     >
                       <img
                         src={item.images && item.images[0] ? item.images[0].url : ''}
                         alt={item.name}
-                        style={{ width: '100%', height: 'auto', borderRadius: '4px' }}
+                        style={styles.image}
                       />
-                      <h3 style={{ margin: '10px 0 5px 0' }}>{item.name}</h3>
+                      <h3 style={styles.cardTitle}>{item.name}</h3>
                       {item.artists && item.artists[0] && (
-                        <p style={{ margin: '5px 0', fontSize: '14px' }}>アーティスト: {item.artists[0].name}</p>
+                        <p style={styles.cardText}>アーティスト: {item.artists[0].name}</p>
                       )}
-                      <p style={{ margin: '5px 0', fontSize: '12px' }}>
+                      <p style={styles.cardText}>
                         リリース日: {item.release_date}
                       </p>
-                      <p style={{ margin: '5px 0', fontSize: '12px' }}>
-                        album_type: {item.album_type}
+                      <button
+                        onClick={() => toggleLike(item)}
+                        style={{
+                          ...styles.likeButton,
+                          color: likes.find(liked => liked.id === item.id) ? 'red' : 'grey'
+                        }}
+                      >
+                        ♥
+                      </button>
+                      <p style={styles.cardLink}>
+                        <a href={item.external_urls.spotify} target="_blank" rel="noopener noreferrer">
+                          Spotifyで見る
+                        </a>
                       </p>
                     </div>
                   ))}
@@ -398,8 +507,164 @@ function App() {
           </div>
         ))
       )}
+
+      {/* ライク一覧の表示 */}
+      {likes.length > 0 && (
+        <div style={styles.likedSection}>
+          <h2>ライクしたアルバム/シングル</h2>
+          <div style={styles.grid}>
+            {likes.map(item => (
+              <div
+                key={item.id}
+                style={styles.card}
+              >
+                <img
+                  src={item.images && item.images[0] ? item.images[0].url : ''}
+                  alt={item.name}
+                  style={styles.image}
+                />
+                <h3 style={styles.cardTitle}>{item.name}</h3>
+                {item.artists && item.artists[0] && (
+                  <p style={styles.cardText}>アーティスト: {item.artists[0].name}</p>
+                )}
+                <p style={styles.cardText}>
+                  リリース日: {item.release_date}
+                </p>
+                <button
+                  onClick={() => toggleLike(item)}
+                  style={{
+                    ...styles.likeButton,
+                    color: 'red'
+                  }}
+                >
+                  ♥
+                </button>
+                <p style={styles.cardLink}>
+                  <a href={item.external_urls.spotify} target="_blank" rel="noopener noreferrer">
+                    Spotifyで見る
+                  </a>
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+const styles = {
+  container: {
+    margin: '20px',
+    fontFamily: 'Arial, sans-serif',
+  },
+  authSection: {
+    marginBottom: '20px',
+  },
+  userInfo: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  logoutButton: {
+    padding: '8px 12px',
+    backgroundColor: '#e0245e',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  searchForm: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    marginBottom: '20px',
+    flexWrap: 'wrap',
+  },
+  dateInput: {
+    padding: '8px',
+    borderRadius: '4px',
+    border: '1px solid #ccc',
+  },
+  searchButton: {
+    padding: '8px 12px',
+    backgroundColor: '#1db954',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  saveButton: {
+    padding: '8px 12px',
+    backgroundColor: '#657786',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  sortSection: {
+    marginBottom: '20px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+  },
+  sortSelect: {
+    padding: '8px',
+    borderRadius: '4px',
+    border: '1px solid #ccc',
+  },
+  error: {
+    color: 'red',
+  },
+  releaseSection: {
+    marginTop: '20px',
+  },
+  grid: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '20px',
+  },
+  card: {
+    border: '1px solid #ccc',
+    borderRadius: '8px',
+    padding: '10px',
+    width: '200px',
+    boxShadow: '2px 2px 12px rgba(0,0,0,0.1)',
+    textAlign: 'center',
+    position: 'relative',
+    backgroundColor: '#fff',
+  },
+  image: {
+    width: '100%',
+    height: 'auto',
+    borderRadius: '4px',
+  },
+  cardTitle: {
+    margin: '10px 0 5px 0',
+    fontSize: '16px',
+    color: '#333',
+  },
+  cardText: {
+    margin: '5px 0',
+    fontSize: '14px',
+    color: '#555',
+  },
+  likeButton: {
+    position: 'absolute',
+    top: '10px',
+    right: '10px',
+    background: 'none',
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: '20px',
+  },
+  cardLink: {
+    margin: '5px 0',
+    fontSize: '12px',
+  },
+  likedSection: {
+    marginTop: '40px',
+  },
+};
 
 export default App;
