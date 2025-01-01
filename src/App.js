@@ -343,6 +343,7 @@ function App() {
   const getSortedReleases = () => {
     const sortedReleases = { ...releases };
     Object.keys(sortedReleases).forEach(date => {
+      // eslint-disable-next-line no-unused-vars
       const { albums, singles } = sortedReleases[date];
       
       // 並び替えロジック
